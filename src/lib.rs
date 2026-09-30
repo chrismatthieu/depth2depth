@@ -10,8 +10,13 @@
 //! `depth_anything_v2_metric_hypersim_vits.pth` into the two safetensors files
 //! this crate loads.
 
+pub mod calibrate;
+pub mod cloud;
 pub mod da2;
 pub mod dinov2;
+
+pub use calibrate::{Anchor, Calibrated, Calibration, CalibrationConfig};
+pub use cloud::{CloudOptions, Pinhole};
 
 pub use candle;
 
@@ -38,6 +43,9 @@ pub struct Config {
     /// A raw pixel is kept when |aligned - raw| < max(abs_tol, rel_tol * aligned).
     pub abs_tol: f32,
     pub rel_tol: f32,
+    /// Fewer trusted pixels than this and the frame keeps the previous fit; a lidar
+    /// cloud lands on far fewer pixels than a depth camera fills.
+    pub min_fit_points: usize,
 }
 
 impl Default for Config {
@@ -51,6 +59,7 @@ impl Default for Config {
             ema_new_weight: 0.3,
             abs_tol: 0.3,
             rel_tol: 0.1,
+            min_fit_points: 500,
         }
     }
 }
@@ -172,10 +181,19 @@ impl Depth2Depth {
             .iter()
             .map(|&z| (cfg.near_m..=cfg.far_m).contains(&z))
             .collect();
-        let (a, b) = fit_affine(&pred, raw_depth_m, &valid, cfg.abs_tol, cfg.rel_tol);
-        let (ema_a, ema_b) = match self.ema {
-            None => (a, b),
-            Some((pa, pb)) => {
+        let fit = fit_affine(
+            &pred,
+            raw_depth_m,
+            &valid,
+            cfg.abs_tol,
+            cfg.rel_tol,
+            cfg.min_fit_points,
+        );
+        let (ema_a, ema_b) = match (self.ema, fit) {
+            (None, Some(fit)) => fit,
+            (None, None) => (1.0, 0.0),
+            (Some(previous), None) => previous,
+            (Some((pa, pb)), Some((a, b))) => {
                 let k = cfg.ema_new_weight;
                 ((1.0 - k) * pa + k * a, (1.0 - k) * pb + k * b)
             }
@@ -200,19 +218,63 @@ impl Depth2Depth {
             b: ema_b,
         })
     }
+
+    /// Dense metric depth for the rgb frame, calibrated to a sparse point cloud
+    /// (camera frame, e.g. lidar moved into the camera's optical frame) rather than
+    /// a depth image; `camera` is the rgb's intrinsics. Points hidden behind nearer
+    /// ones from the camera's viewpoint are dropped first. See [`calibrate`].
+    pub fn fuse_points(
+        &mut self,
+        rgb: &[u8],
+        height: usize,
+        width: usize,
+        points: &[[f32; 3]],
+        camera: &Pinhole,
+        calibration: &mut Calibration,
+    ) -> Result<Calibrated> {
+        let pred = self.predict(rgb, height, width)?;
+        let anchors = cloud::visible_anchors(points, camera, height, width);
+        Ok(calibration.apply(&pred, height, width, &anchors))
+    }
+}
+
+impl Fusion {
+    /// The fused depth as camera-frame points, cropped and decimated by `options`.
+    pub fn points(
+        &self,
+        height: usize,
+        width: usize,
+        camera: &Pinhole,
+        options: &CloudOptions,
+    ) -> Vec<[f32; 3]> {
+        cloud::depth_to_points(&self.fused, height, width, camera, options)
+    }
+}
+
+impl Calibrated {
+    /// The calibrated depth as camera-frame points, cropped and decimated by `options`.
+    pub fn points(
+        &self,
+        height: usize,
+        width: usize,
+        camera: &Pinhole,
+        options: &CloudOptions,
+    ) -> Vec<[f32; 3]> {
+        cloud::depth_to_points(&self.depth, height, width, camera, options)
+    }
 }
 
 /// Robust least-squares fit raw ~ a * pred + b over valid pixels; one refit
-/// after dropping residual outliers.
+/// after dropping residual outliers. None when fewer than `min_points` take part.
 pub fn fit_affine(
     pred: &[f32],
     raw: &[f32],
     valid: &[bool],
     abs_tol: f32,
     rel_tol: f32,
-) -> (f32, f32) {
-    let mut a = 1.0f64;
-    let mut b = 0.0f64;
+    min_points: usize,
+) -> Option<(f32, f32)> {
+    let mut fit = None;
     let mut inlier: Vec<bool> = valid.to_vec();
     for _ in 0..2 {
         let (mut sp, mut spp, mut sr, mut spr, mut n) = (0f64, 0f64, 0f64, 0f64, 0f64);
@@ -227,22 +289,24 @@ pub fn fit_affine(
                 n += 1.0;
             }
         }
-        if n < 500.0 {
+        if n < min_points as f64 {
             break;
         }
         let det = spp * n - sp * sp;
         if det.abs() < 1e-9 {
             break;
         }
-        a = (spr * n - sp * sr) / det;
-        b = (spp * sr - sp * spr) / det;
-        let (af, bf) = (a as f32, b as f32);
+        let (af, bf) = (
+            ((spr * n - sp * sr) / det) as f32,
+            ((spp * sr - sp * spr) / det) as f32,
+        );
+        fit = Some((af, bf));
         for i in 0..pred.len() {
             let resid = (af * pred[i] + bf - raw[i]).abs();
             inlier[i] = valid[i] && resid < abs_tol.max(rel_tol * raw[i]);
         }
     }
-    (a as f32, b as f32)
+    fit
 }
 
 pub fn bilinear_resize(
@@ -271,4 +335,27 @@ pub fn bilinear_resize(
         }
     }
     dst
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_fit_recovers_the_scale_and_ignores_an_outlier() {
+        let pred: Vec<f32> = (0..1000).map(|i| 1.0 + i as f32 * 0.005).collect();
+        let mut raw: Vec<f32> = pred.iter().map(|p| 0.5 * p + 0.2).collect();
+        raw[10] = 50.0;
+        let valid = vec![true; raw.len()];
+        let (a, b) = fit_affine(&pred, &raw, &valid, 0.3, 0.1, 500).unwrap();
+        assert!((a - 0.5).abs() < 1e-3 && (b - 0.2).abs() < 1e-3, "{a} {b}");
+    }
+
+    #[test]
+    fn too_few_anchor_points_give_no_fit() {
+        let pred = vec![1.0f32, 2.0, 3.0];
+        let raw = vec![2.0f32, 4.0, 6.0];
+        assert_eq!(fit_affine(&pred, &raw, &[true; 3], 0.3, 0.1, 500), None);
+        assert!(fit_affine(&pred, &raw, &[true; 3], 0.3, 0.1, 3).is_some());
+    }
 }

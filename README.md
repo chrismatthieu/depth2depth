@@ -51,6 +51,31 @@ let fusion = d2d.fuse(&rgb, &raw_depth_m, height, width)?;
 
 Pure Rust, no Python and no ONNX runtime at inference time. Inference runs on [candle](https://github.com/huggingface/candle), so the GPU backend is a cargo feature: `cuda` / `cudnn` (NVIDIA, incl. Jetson), `metal` (Apple), or nothing for CPU.
 
+## From a lidar instead of a depth image
+
+A lidar gives far fewer, far more accurate readings, from somewhere other than the camera. `fuse_points` takes them as a camera-frame point cloud plus the (undistorted) image's pinhole intrinsics:
+
+```rust
+use depth2depth::{Calibration, CalibrationConfig, CloudOptions, Pinhole};
+
+let camera = Pinhole { fx, fy, cx, cy };
+let mut calibration = Calibration::new(CalibrationConfig::default()); // keep it across frames
+// lidar_in_camera: &[[f32; 3]], x right, y down, z forward, meters
+let depth = d2d.fuse_points(&rgb, height, width, &lidar_in_camera, &camera, &mut calibration)?;
+// depth.depth: dense HxW meters; depth.support: 0..1, how much each pixel leans on nearby lidar
+
+// Out as a cloud: every crop runs before the decimation and the point budget.
+let options = CloudOptions { max_range_m: 6.0, bounds: Some((min_xyz, max_xyz)), decimation: 4, max_points: Some(20_000), ..Default::default() };
+let points = depth.points(height, width, &camera, &options);
+```
+
+A single affine fit is not enough here: on a robot's head camera the floor near the bottom of the image came out up to 2x too far while the walls fit, which put the near floor under the real one. So the calibration is per pixel, in two parts:
+
+1. A smooth fit `log z = g·log pred + c + quadratic(x, y)` over all the lidar pixels, its image-position part averaged across frames (it is mostly the lens), carries the correction where there is no lidar nearby.
+2. Where there is, what the smooth fit still gets wrong is spread edge-aware: each pixel averages its nearest lidar pixels in (column, row, log predicted depth), so a correction measured on a wall does not leak onto the object in front of it.
+
+Lidar points the camera cannot see (behind the edge of a nearer object, from the camera's viewpoint) are dropped before either. On six R1 Pro drives, with a fifth of each Mid-360 scan held out: median error 0.04–0.07 m, and 0.1–4% of the cloud more than 0.3 m under the floor, against 7–16% for the single affine fit. `Fusion::points` does the same cloud output for `fuse`.
+
 ## The raw depth is mostly missing
 
 Stereo depth needs texture. Blank walls, dark corners, shiny floors, thin chair legs and anything past the projector's useful range come back as nothing at all — and what does come back is speckled with single-pixel dropouts and torn object edges that flicker frame to frame.
