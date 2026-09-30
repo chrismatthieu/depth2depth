@@ -13,6 +13,7 @@
 //!   its image-position part averaged over frames since it is mostly the lens.
 
 use kiddo::{KdTree, SquaredEuclidean};
+use rayon::prelude::*;
 
 /// A pixel with a trusted metric depth.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -112,6 +113,7 @@ impl Calibration {
         let (g, c) = self.scale.unwrap_or((1.0, 0.0));
         let shape = self.shape.unwrap_or([0.0; 5]);
         let mut depth: Vec<f32> = (0..height * width)
+            .into_par_iter()
             .map(|i| {
                 let basis = quadratic(i % width, i / width, height, width);
                 (g * log_pred[i] as f64 + c + dot(&shape, &basis)).exp() as f32
@@ -126,11 +128,16 @@ impl Calibration {
                 .collect();
             let (field, nearest) =
                 self.edge_aware(&anchors, &residual, &log_pred, &at, height, width);
-            for i in 0..height * width {
-                let w = (1.5 - nearest[i] / self.config.reach).clamp(0.0, 1.0);
-                depth[i] *= (w * field[i]).exp();
-                support[i] = w;
-            }
+            let reach = self.config.reach;
+            depth
+                .par_iter_mut()
+                .zip(support.par_iter_mut())
+                .zip(field.par_iter().zip(nearest.par_iter()))
+                .for_each(|((depth, support), (field, nearest))| {
+                    let w = (1.5 - nearest / reach).clamp(0.0, 1.0);
+                    *depth *= (w * field).exp();
+                    *support = w;
+                });
         }
         Calibrated { depth, support }
     }
@@ -195,11 +202,10 @@ impl Calibration {
         }
         let step = cfg.grid_step.max(1);
         let (gh, gw) = ((height - 1) / step + 1, (width - 1) / step + 1);
-        let mut field = vec![0f32; gh * gw];
-        let mut nearest = vec![0f32; gh * gw];
-        for gy in 0..gh {
-            for gx in 0..gw {
-                let (x, y) = (gx * step, gy * step);
+        let (field, nearest): (Vec<f32>, Vec<f32>) = (0..gh * gw)
+            .into_par_iter()
+            .map(|cell| {
+                let (x, y) = ((cell % gw) * step, (cell / gw) * step);
                 let found = tree.nearest_n::<SquaredEuclidean>(
                     &feature(x as f32, y as f32, log_pred[y * width + x]),
                     cfg.neighbours,
@@ -210,10 +216,10 @@ impl Calibration {
                     sum += w * residual[n.item as usize];
                     weights += w;
                 }
-                field[gy * gw + gx] = sum / weights;
-                nearest[gy * gw + gx] = found.first().map_or(f32::INFINITY, |n| n.distance.sqrt());
-            }
-        }
+                let nearest = found.first().map_or(f32::INFINITY, |n| n.distance.sqrt());
+                (sum / weights, nearest)
+            })
+            .unzip();
         (
             crate::bilinear_resize(&field, gh, gw, height, width),
             crate::bilinear_resize(&nearest, gh, gw, height, width),

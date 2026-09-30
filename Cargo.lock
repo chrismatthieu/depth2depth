@@ -450,6 +450,7 @@ dependencies = [
  "cc",
  "image",
  "kiddo",
+ "rayon",
 ]
 
 [[package]]
