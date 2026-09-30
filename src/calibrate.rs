@@ -94,47 +94,35 @@ impl Calibration {
         anchors: &[Anchor],
     ) -> Calibrated {
         assert_eq!(pred.len(), height * width, "pred must be HxW");
-        let anchors: Vec<Anchor> = anchors
-            .iter()
-            .copied()
-            .filter(|a| {
-                a.z > 0.0
-                    && a.u >= 0.0
-                    && a.v >= 0.0
-                    && (a.u as usize) < width
-                    && (a.v as usize) < height
-            })
-            .collect();
+        let anchors = in_image(anchors, height, width);
         let log_pred: Vec<f32> = pred.iter().map(|&p| p.max(1e-3).ln()).collect();
-        let at = |a: &Anchor| log_pred[a.v as usize * width + a.u as usize];
         if anchors.len() >= self.config.min_anchors {
-            self.fit_smooth(&anchors, &at, height, width);
+            self.fit_smooth(&anchors, &log_pred, height, width);
         }
-        let (g, c) = self.scale.unwrap_or((1.0, 0.0));
-        let shape = self.shape.unwrap_or([0.0; 5]);
         let mut depth: Vec<f32> = (0..height * width)
             .into_par_iter()
-            .map(|i| {
-                let basis = quadratic(i % width, i / width, height, width);
-                (g * log_pred[i] as f64 + c + dot(&shape, &basis)).exp() as f32
-            })
+            .map(|i| self.smooth(log_pred[i], i % width, i / width, height, width))
             .collect();
         let mut support = vec![0f32; height * width];
         if anchors.len() >= self.config.neighbours {
-            // What the smooth fit still gets wrong at each anchor, spread edge-aware.
-            let residual: Vec<f32> = anchors
-                .iter()
-                .map(|a| a.z.ln() - depth[a.v as usize * width + a.u as usize].ln())
-                .collect();
-            let (field, nearest) =
-                self.edge_aware(&anchors, &residual, &log_pred, &at, height, width);
-            let reach = self.config.reach;
+            let spread = Spread::new(self, &anchors, &log_pred, height, width);
+            let step = self.config.grid_step.max(1);
+            let (gh, gw) = ((height - 1) / step + 1, (width - 1) / step + 1);
+            let (field, nearest): (Vec<f32>, Vec<f32>) = (0..gh * gw)
+                .into_par_iter()
+                .map(|cell| {
+                    let (x, y) = ((cell % gw) * step, (cell / gw) * step);
+                    spread.at(x, y, log_pred[y * width + x])
+                })
+                .unzip();
+            let field = crate::bilinear_resize(&field, gh, gw, height, width);
+            let nearest = crate::bilinear_resize(&nearest, gh, gw, height, width);
             depth
                 .par_iter_mut()
                 .zip(support.par_iter_mut())
                 .zip(field.par_iter().zip(nearest.par_iter()))
                 .for_each(|((depth, support), (field, nearest))| {
-                    let w = (1.5 - nearest / reach).clamp(0.0, 1.0);
+                    let w = self.weight(*nearest);
                     *depth *= (w * field).exp();
                     *support = w;
                 });
@@ -142,22 +130,61 @@ impl Calibration {
         Calibrated { depth, support }
     }
 
-    /// Robust `log z = g·log pred + c + shape·quadratic(x, y)`; the shape is averaged over frames.
-    fn fit_smooth(
-        &mut self,
-        anchors: &[Anchor],
-        at: &dyn Fn(&Anchor) -> f32,
+    /// What `apply` would give at a few `(column, row)` pixels, without touching the averaged fit:
+    /// for choosing extra anchors (a floor, say) before the real `apply`.
+    pub fn probe(
+        &self,
+        pred: &[f32],
         height: usize,
         width: usize,
-    ) {
+        anchors: &[Anchor],
+        pixels: &[(usize, usize)],
+    ) -> Vec<f32> {
+        assert_eq!(pred.len(), height * width, "pred must be HxW");
+        let mut fit = self.clone();
+        let anchors = in_image(anchors, height, width);
+        let log_pred: Vec<f32> = pred.iter().map(|&p| p.max(1e-3).ln()).collect();
+        if anchors.len() >= fit.config.min_anchors {
+            fit.fit_smooth(&anchors, &log_pred, height, width);
+        }
+        let spread = (anchors.len() >= fit.config.neighbours)
+            .then(|| Spread::new(&fit, &anchors, &log_pred, height, width));
+        pixels
+            .par_iter()
+            .map(|&(x, y)| {
+                let lp = log_pred[y * width + x];
+                let smooth = fit.smooth(lp, x, y, height, width);
+                match &spread {
+                    Some(spread) => {
+                        let (field, nearest) = spread.at(x, y, lp);
+                        smooth * (fit.weight(nearest) * field).exp()
+                    }
+                    None => smooth,
+                }
+            })
+            .collect()
+    }
+
+    /// The smooth fit's depth at pixel (u, v).
+    fn smooth(&self, log_pred: f32, u: usize, v: usize, height: usize, width: usize) -> f32 {
+        let (g, c) = self.scale.unwrap_or((1.0, 0.0));
+        let shape = self.shape.unwrap_or([0.0; 5]);
+        (g * log_pred as f64 + c + dot(&shape, &quadratic(u, v, height, width))).exp() as f32
+    }
+
+    /// How much a pixel trusts the edge-aware correction, from its distance to the nearest anchor.
+    fn weight(&self, nearest: f32) -> f32 {
+        (1.5 - nearest / self.config.reach).clamp(0.0, 1.0)
+    }
+
+    /// Robust `log z = g·log pred + c + shape·quadratic(x, y)`; the shape is averaged over frames.
+    fn fit_smooth(&mut self, anchors: &[Anchor], log_pred: &[f32], height: usize, width: usize) {
         let rows: Vec<([f64; 7], f64)> = anchors
             .iter()
             .map(|a| {
                 let b = quadratic(a.u as usize, a.v as usize, height, width);
-                (
-                    [at(a) as f64, 1.0, b[0], b[1], b[2], b[3], b[4]],
-                    (a.z as f64).ln(),
-                )
+                let lp = log_pred[a.v as usize * width + a.u as usize] as f64;
+                ([lp, 1.0, b[0], b[1], b[2], b[3], b[4]], (a.z as f64).ln())
             })
             .collect();
         let Some(full) = robust_lstsq::<7>(&rows) else {
@@ -180,50 +207,78 @@ impl Calibration {
             self.scale = Some((g, c));
         }
     }
+}
 
-    /// `residual` (log anchor / log smooth fit) averaged over each pixel's nearest anchors in (u, v, log pred),
-    /// and the distance to the nearest one, both at full resolution.
-    fn edge_aware(
-        &self,
+/// The anchors that land inside the image with a positive depth.
+fn in_image(anchors: &[Anchor], height: usize, width: usize) -> Vec<Anchor> {
+    anchors
+        .iter()
+        .copied()
+        .filter(|a| {
+            a.z > 0.0
+                && a.u >= 0.0
+                && a.v >= 0.0
+                && (a.u as usize) < width
+                && (a.v as usize) < height
+        })
+        .collect()
+}
+
+/// What the smooth fit still gets wrong at each anchor, spread edge-aware: a pixel averages its
+/// nearest anchors in (column, row, log predicted depth).
+struct Spread<'a> {
+    config: &'a CalibrationConfig,
+    tree: KdTree<f32, 3>,
+    residual: Vec<f32>,
+}
+
+impl<'a> Spread<'a> {
+    fn new(
+        fit: &'a Calibration,
         anchors: &[Anchor],
-        residual: &[f32],
         log_pred: &[f32],
-        at: &dyn Fn(&Anchor) -> f32,
         height: usize,
         width: usize,
-    ) -> (Vec<f32>, Vec<f32>) {
-        let cfg = &self.config;
-        let feature = |u: f32, v: f32, lp: f32| {
-            [u / cfg.sigma_px, v / cfg.sigma_px, lp / cfg.sigma_log_depth]
+    ) -> Self {
+        let mut spread = Spread {
+            config: &fit.config,
+            tree: KdTree::new(),
+            residual: Vec::with_capacity(anchors.len()),
         };
-        let mut tree: KdTree<f32, 3> = KdTree::new();
         for (i, a) in anchors.iter().enumerate() {
-            tree.add(&feature(a.u, a.v, at(a)), i as u64);
+            let (u, v) = (a.u as usize, a.v as usize);
+            let lp = log_pred[v * width + u];
+            spread.tree.add(&spread.feature(a.u, a.v, lp), i as u64);
+            spread
+                .residual
+                .push(a.z.ln() - fit.smooth(lp, u, v, height, width).ln());
         }
-        let step = cfg.grid_step.max(1);
-        let (gh, gw) = ((height - 1) / step + 1, (width - 1) / step + 1);
-        let (field, nearest): (Vec<f32>, Vec<f32>) = (0..gh * gw)
-            .into_par_iter()
-            .map(|cell| {
-                let (x, y) = ((cell % gw) * step, (cell / gw) * step);
-                let found = tree.nearest_n::<SquaredEuclidean>(
-                    &feature(x as f32, y as f32, log_pred[y * width + x]),
-                    cfg.neighbours,
-                );
-                let (mut sum, mut weights) = (0f32, 0f32);
-                for n in &found {
-                    let w = (-0.5 * n.distance).exp() + 1e-9;
-                    sum += w * residual[n.item as usize];
-                    weights += w;
-                }
-                let nearest = found.first().map_or(f32::INFINITY, |n| n.distance.sqrt());
-                (sum / weights, nearest)
-            })
-            .unzip();
-        (
-            crate::bilinear_resize(&field, gh, gw, height, width),
-            crate::bilinear_resize(&nearest, gh, gw, height, width),
-        )
+        spread
+    }
+
+    fn feature(&self, u: f32, v: f32, log_pred: f32) -> [f32; 3] {
+        let cfg = self.config;
+        [
+            u / cfg.sigma_px,
+            v / cfg.sigma_px,
+            log_pred / cfg.sigma_log_depth,
+        ]
+    }
+
+    /// The averaged residual (log) at a pixel, and its distance to the nearest anchor.
+    fn at(&self, x: usize, y: usize, log_pred: f32) -> (f32, f32) {
+        let found = self.tree.nearest_n::<SquaredEuclidean>(
+            &self.feature(x as f32, y as f32, log_pred),
+            self.config.neighbours,
+        );
+        let (mut sum, mut weights) = (0f32, 0f32);
+        for n in &found {
+            let w = (-0.5 * n.distance).exp() + 1e-9;
+            sum += w * self.residual[n.item as usize];
+            weights += w;
+        }
+        let nearest = found.first().map_or(f32::INFINITY, |n| n.distance.sqrt());
+        (sum / weights, nearest)
     }
 }
 
@@ -401,6 +456,26 @@ mod tests {
             first.depth[123],
             second.depth[123]
         );
+    }
+
+    #[test]
+    fn a_probe_matches_apply_and_leaves_the_averaged_fit_alone() {
+        let truth = |u: usize, v: usize| 1.0 + (u + v) as f32 * 0.05;
+        let pred: Vec<f32> = (0..H * W)
+            .map(|i| 2.0 * truth(i % W, i / W).powf(0.8))
+            .collect();
+        let anchors = grid_anchors(&truth, 3);
+        let calibration = Calibration::new(CalibrationConfig::default());
+        let probed = calibration.probe(&pred, H, W, &anchors, &[(40, 30), (8, 52)]);
+        assert!(calibration.shape.is_none() && calibration.scale.is_none());
+        let applied = calibration.clone().apply(&pred, H, W, &anchors);
+        for (p, (x, y)) in probed.iter().zip([(40, 30), (8, 52)]) {
+            assert!(
+                (p - applied.depth[y * W + x]).abs() < 0.02 * p,
+                "{p} {}",
+                applied.depth[y * W + x]
+            );
+        }
     }
 
     #[test]
