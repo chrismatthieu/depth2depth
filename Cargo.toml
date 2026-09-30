@@ -14,6 +14,9 @@ candle = { version = "0.11", package = "candle-core" }
 candle-nn = "0.11"
 kiddo = "5"
 
+[build-dependencies]
+cc = "1"
+
 [dev-dependencies]
 anyhow = "1"
 image = { version = "0.25", default-features = false, features = ["jpeg"] }
@@ -23,6 +26,8 @@ default = []
 cuda = ["candle/cuda", "candle-nn/cuda"]
 cudnn = ["cuda", "candle/cudnn"]
 metal = ["candle/metal", "candle-nn/metal"]
+# Depth Anything through TensorRT on NVIDIA (Jetson) GPUs; needs TensorRT and CUDA installed (see build.rs).
+tensorrt = []
 
 [[example]]
 name = "clip"

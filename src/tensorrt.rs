@@ -1,0 +1,60 @@
+//! Depth Anything through TensorRT (feature `tensorrt`), for Jetsons, where candle's CUDA
+//! path is bound by kernel launches: on an Orin the same 364x448 frame took 190 ms in candle.
+//!
+//! TensorRT builds an engine from the ONNX export once (minutes on an Orin) and caches it
+//! at `engine_path`; an engine is tied to the GPU and the TensorRT version, so delete the
+//! cache after upgrading either.
+
+use std::ffi::{c_char, c_int, c_void, CString};
+use std::sync::Mutex;
+
+extern "C" {
+    fn d2d_trt_open(onnx_path: *const c_char, engine_path: *const c_char, error: *mut c_char, error_length: usize) -> *mut c_void;
+    fn d2d_trt_input_size(handle: *mut c_void, height: *mut c_int, width: *mut c_int);
+    fn d2d_trt_infer(handle: *mut c_void, input: *const f32, output: *mut f32) -> c_int;
+    fn d2d_trt_close(handle: *mut c_void);
+}
+
+struct Handle(*mut c_void);
+
+// The engine is only touched under the mutex, one inference at a time.
+unsafe impl Send for Handle {}
+
+pub struct TrtDepth {
+    handle: Mutex<Handle>,
+    pub height: usize,
+    pub width: usize,
+}
+
+impl TrtDepth {
+    pub fn open(onnx_path: &str, engine_path: &str) -> Result<Self, String> {
+        let onnx = CString::new(onnx_path).map_err(|e| e.to_string())?;
+        let engine = CString::new(engine_path).map_err(|e| e.to_string())?;
+        let mut error = vec![0 as c_char; 512];
+        let handle = unsafe { d2d_trt_open(onnx.as_ptr(), engine.as_ptr(), error.as_mut_ptr(), error.len()) };
+        if handle.is_null() {
+            let message = unsafe { std::ffi::CStr::from_ptr(error.as_ptr()) };
+            return Err(message.to_string_lossy().into_owned());
+        }
+        let (mut height, mut width) = (0, 0);
+        unsafe { d2d_trt_input_size(handle, &mut height, &mut width) };
+        Ok(Self { handle: Mutex::new(Handle(handle)), height: height as usize, width: width as usize })
+    }
+
+    /// `input` is the normalised 3xHxW image at the engine's size; returns HxW meters.
+    pub fn infer(&self, input: &[f32]) -> Result<Vec<f32>, String> {
+        assert_eq!(input.len(), 3 * self.height * self.width, "input must be 3xHxW at the engine's size");
+        let mut output = vec![0f32; self.height * self.width];
+        let handle = self.handle.lock().unwrap();
+        match unsafe { d2d_trt_infer(handle.0, input.as_ptr(), output.as_mut_ptr()) } {
+            0 => Ok(output),
+            code => Err(format!("TensorRT inference failed (step {code})")),
+        }
+    }
+}
+
+impl Drop for TrtDepth {
+    fn drop(&mut self) {
+        unsafe { d2d_trt_close(self.handle.get_mut().unwrap().0) };
+    }
+}

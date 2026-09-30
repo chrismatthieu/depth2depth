@@ -447,6 +447,7 @@ dependencies = [
  "anyhow",
  "candle-core",
  "candle-nn",
+ "cc",
  "image",
  "kiddo",
 ]

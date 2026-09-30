@@ -14,6 +14,8 @@ pub mod calibrate;
 pub mod cloud;
 pub mod da2;
 pub mod dinov2;
+#[cfg(feature = "tensorrt")]
+pub mod tensorrt;
 
 pub use calibrate::{Anchor, Calibrated, Calibration, CalibrationConfig};
 pub use cloud::{CloudOptions, Pinhole};
@@ -89,11 +91,19 @@ pub struct Fusion {
 }
 
 pub struct Depth2Depth {
-    model: da2::DepthAnythingV2,
-    device: Device,
-    dtype: DType,
+    model: Model,
     config: Config,
     ema: Option<(f32, f32)>,
+}
+
+enum Model {
+    Candle {
+        network: da2::DepthAnythingV2,
+        device: Device,
+        dtype: DType,
+    },
+    #[cfg(feature = "tensorrt")]
+    TensorRt(tensorrt::TrtDepth),
 }
 
 // Async module frameworks need the model to cross threads; keep it that way.
@@ -121,11 +131,26 @@ impl Depth2Depth {
             config.model_w,
             config.max_depth,
         );
-        let model = da2::DepthAnythingV2::new(Arc::new(dino), da2_config, head_vb)?;
+        let network = da2::DepthAnythingV2::new(Arc::new(dino), da2_config, head_vb)?;
         Ok(Self {
-            model,
-            device,
-            dtype,
+            model: Model::Candle {
+                network,
+                device,
+                dtype,
+            },
+            config,
+            ema: None,
+        })
+    }
+
+    /// The model as a TensorRT engine built from its ONNX export (see [`tensorrt`]); the
+    /// model input size is the export's, whatever `config` says.
+    #[cfg(feature = "tensorrt")]
+    pub fn new_tensorrt(onnx_path: &str, engine_path: &str, mut config: Config) -> Result<Self> {
+        let engine = tensorrt::TrtDepth::open(onnx_path, engine_path).map_err(candle::Error::Msg)?;
+        (config.model_h, config.model_w) = (engine.height, engine.width);
+        Ok(Self {
+            model: Model::TensorRt(engine),
             config,
             ema: None,
         })
@@ -151,10 +176,20 @@ impl Depth2Depth {
                     (v / 255.0 - IMAGENET_MEAN[channel]) / IMAGENET_STD[channel];
             }
         }
-        let input = Tensor::from_vec(chw, (1, 3, cfg.model_h, cfg.model_w), &self.device)?
-            .to_dtype(self.dtype)?;
-        let depth = self.model.forward(&input)?;
-        let pred_small: Vec<f32> = depth.to_dtype(DType::F32)?.flatten_all()?.to_vec1()?;
+        let pred_small: Vec<f32> = match &self.model {
+            Model::Candle {
+                network,
+                device,
+                dtype,
+            } => {
+                let input = Tensor::from_vec(chw, (1, 3, cfg.model_h, cfg.model_w), device)?
+                    .to_dtype(*dtype)?;
+                let depth = network.forward(&input)?;
+                depth.to_dtype(DType::F32)?.flatten_all()?.to_vec1()?
+            }
+            #[cfg(feature = "tensorrt")]
+            Model::TensorRt(engine) => engine.infer(&chw).map_err(candle::Error::Msg)?,
+        };
         Ok(bilinear_resize(
             &pred_small,
             cfg.model_h,
