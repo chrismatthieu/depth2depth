@@ -137,6 +137,14 @@ cargo run --release --features cuda --example clip -- \
 
 `depth_mm.npy` is a `(frames, H, W)` uint16 array of millimeters; `rgb_dir/` holds one jpg per frame. Needs `ffmpeg` on PATH.
 
+`examples/live.rs` opens the same three panels on a connected RealSense, updating as fast as the model runs. Close the window or press Esc. Needs librealsense installed.
+
+```sh
+cargo run --release --features cuda,live --example live
+```
+
+Weights default to `weights/dinov2_vits14.safetensors` and `weights/da2_head_vits.safetensors`.
+
 ## Building
 
 - NVIDIA: `cargo build --release --features cuda` (add `cudnn` if libcudnn is installed — much faster convolutions; on Jetson set `CUDA_COMPUTE_CAP` to your arch, e.g. `87` for Orin).

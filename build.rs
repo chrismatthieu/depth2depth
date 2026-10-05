@@ -3,6 +3,23 @@
 
 fn main() {
     println!("cargo:rerun-if-changed=src/tensorrt.cpp");
+    println!("cargo:rerun-if-changed=examples/live_camera.cpp");
+    if std::env::var_os("CARGO_FEATURE_LIVE").is_some() {
+        cc::Build::new()
+            .cpp(true)
+            .std("c++17")
+            .file("examples/live_camera.cpp")
+            .include("/usr/local/include")
+            .warnings(false)
+            .compile("d2d_live");
+        println!("cargo:rustc-link-search=native=/usr/local/lib");
+        println!("cargo:rustc-link-lib=realsense2");
+        println!("cargo:rustc-link-lib=stdc++");
+        // The final link is done by cc, so -Wl reaches ld. Keeps the viewer runnable
+        // without LD_LIBRARY_PATH for librealsense and the CUDA runtime.
+        println!("cargo:rustc-link-arg=-Wl,-rpath,/usr/local/lib");
+        println!("cargo:rustc-link-arg=-Wl,-rpath,/usr/local/cuda/lib64");
+    }
     if std::env::var_os("CARGO_FEATURE_TENSORRT").is_none() {
         return;
     }

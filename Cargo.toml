@@ -21,6 +21,7 @@ cc = "1"
 [dev-dependencies]
 anyhow = "1"
 image = { version = "0.25", default-features = false, features = ["jpeg"] }
+minifb = "0.28"
 
 [features]
 default = []
@@ -29,6 +30,12 @@ cudnn = ["cuda", "candle/cudnn"]
 metal = ["candle/metal", "candle-nn/metal"]
 # Depth Anything through TensorRT on NVIDIA (Jetson) GPUs; needs TensorRT and CUDA installed (see build.rs).
 tensorrt = []
+# Live RealSense viewer (examples/live.rs). Needs librealsense installed.
+live = []
 
 [[example]]
 name = "clip"
+
+[[example]]
+name = "live"
+required-features = ["live"]
